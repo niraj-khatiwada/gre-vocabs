@@ -56,6 +56,63 @@ Bun.serve({
       return Response.json(sessions);
     }
 
+    // API: Resync Missing Words into Active Sessions
+    if (pathname === "/api/sessions/resync" && req.method === "POST") {
+      const activeSessions = db
+        .prepare("SELECT id FROM sessions WHERE status = 'active'")
+        .all() as { id: number }[];
+      let totalAdded = 0;
+
+      db.transaction(() => {
+        for (const session of activeSessions) {
+          // Find vocabulary IDs missing from this session
+          const missingVocab = db
+            .prepare(
+              `
+            SELECT v.id
+            FROM vocab v
+            WHERE v.id NOT IN (
+              SELECT vocab_id FROM session_cards WHERE session_id = ?
+            )
+          `,
+            )
+            .all(session.id) as { id: number }[];
+
+          if (missingVocab.length > 0) {
+            // Get current max card_order for the session
+            const maxOrderRow = db
+              .prepare(
+                `
+              SELECT COALESCE(MAX(card_order), -1) as max_order
+              FROM session_cards
+              WHERE session_id = ?
+            `,
+              )
+              .get(session.id) as { max_order: number };
+
+            let startOrder = maxOrderRow.max_order + 1;
+            const shuffledMissing = shuffle([...missingVocab]);
+
+            const insertCard = db.prepare(`
+              INSERT INTO session_cards (session_id, vocab_id, card_order, status)
+              VALUES ($session_id, $vocab_id, $card_order, 'unseen')
+            `);
+
+            shuffledMissing.forEach((item, index) => {
+              insertCard.run({
+                $session_id: session.id,
+                $vocab_id: item.id,
+                $card_order: startOrder + index,
+              });
+              totalAdded++;
+            });
+          }
+        }
+      })();
+
+      return Response.json({ success: true, added_cards: totalAdded });
+    }
+
     // API: Start a New Session
     if (pathname === "/api/sessions" && req.method === "POST") {
       const allVocab = db.prepare("SELECT id FROM vocab").all() as {
@@ -222,6 +279,7 @@ const HTML_CONTENT = `
     /* Dashboard */
     .dashboard { display: flex; flex-direction: column; gap: 1.5rem; }
     .action-bar { display: flex; justify-content: space-between; align-items: center; }
+    .button-group { display: flex; gap: 0.5rem; }
     .session-list { display: flex; flex-direction: column; gap: 0.75rem; }
     .session-item {
       background: var(--card-bg);
@@ -261,6 +319,7 @@ const HTML_CONTENT = `
       padding-top: 1.5rem;
       border-top: 1px solid var(--border);
       line-height: 1.6;
+      font-size: 1.2rem;
     }
     .markdown-content img { max-width: 100%; height: auto; border-radius: 8px; margin: 1rem 0; }
 
@@ -284,7 +343,10 @@ const HTML_CONTENT = `
     <div id="view-home" class="dashboard">
       <div class="action-bar">
         <h2>Practice Sessions</h2>
-        <button class="btn" onclick="startNewSession()">+ New Session</button>
+        <div class="button-group">
+          <button class="btn btn-secondary" onclick="resyncSessions()">🔄 Resync</button>
+          <button class="btn" onclick="startNewSession()">+ New Session</button>
+        </div>
       </div>
       <div id="session-list" class="session-list"></div>
     </div>
@@ -346,6 +408,13 @@ const HTML_CONTENT = `
       \`).join('');
     }
 
+    async function resyncSessions() {
+      const res = await fetch('/api/sessions/resync', { method: 'POST' });
+      const data = await res.json();
+      alert(\`Resynced! Added \${data.added_cards} new card(s) across active sessions.\`);
+      loadSessions();
+    }
+
     async function startNewSession() {
       const res = await fetch('/api/sessions', { method: 'POST' });
       const data = await res.json();
@@ -361,7 +430,6 @@ const HTML_CONTENT = `
     }
 
     async function fetchNextCard() {
-      // Reset card UI
       document.getElementById('card-answer').style.display = 'none';
       document.getElementById('answer-actions').style.display = 'none';
       document.getElementById('btn-reveal').style.display = 'inline-block';
@@ -380,7 +448,6 @@ const HTML_CONTENT = `
       document.getElementById('card-word').innerText = currentCard.name;
       document.getElementById('ref-tag').innerText = currentCard.ref;
 
-      // Parse markdown text using marked.js
       document.getElementById('card-answer').innerHTML = marked.parse(currentCard.text);
     }
 
@@ -415,7 +482,6 @@ const HTML_CONTENT = `
       loadSessions();
     }
 
-    // Initial Load
     loadSessions();
   </script>
 </body>
