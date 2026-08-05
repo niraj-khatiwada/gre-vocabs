@@ -3,7 +3,18 @@ import { join } from "path";
 
 const db = new Database("vocab.sqlite");
 
-// Helper: Fisher-Yates Shuffle
+// Initialize Schema Additions
+db.run(`
+  CREATE TABLE IF NOT EXISTS vocab_mastery (
+    vocab_id INTEGER PRIMARY KEY,
+    box INTEGER DEFAULT 1, -- 1: Learning, 2: Reviewing, 3: Learned
+    next_review_at DATETIME DEFAULT CURRENT_TIMESTAMP,
+    updated_at DATETIME DEFAULT CURRENT_TIMESTAMP,
+    FOREIGN KEY(vocab_id) REFERENCES vocab(id)
+  );
+`);
+
+// Fisher-Yates Shuffle Helper
 function shuffle<T>(array: T[]): T[] {
   for (let i = array.length - 1; i > 0; i--) {
     const j = Math.floor(Math.random() * (i + 1));
@@ -20,7 +31,7 @@ Bun.serve({
     const url = new URL(req.url);
     const pathname = url.pathname;
 
-    // Static Assets: Serve images located inside GRE/
+    // Serve Local Images from GRE/ folder
     if (pathname.match(/\.(png|jpg|jpeg|gif|webp)$/i)) {
       const imagePath = join(
         process.cwd(),
@@ -37,9 +48,8 @@ Bun.serve({
     // API: Vocabulary Search
     if (pathname === "/api/search" && req.method === "GET") {
       const query = url.searchParams.get("q") || "";
-      if (!query.trim()) {
-        return Response.json([]);
-      }
+      if (!query.trim()) return Response.json([]);
+
       const results = db
         .prepare(
           `
@@ -54,7 +64,7 @@ Bun.serve({
       return Response.json(results);
     }
 
-    // API: Get List of All Sessions
+    // API: Get List of Sessions with Mastery Stats
     if (pathname === "/api/sessions" && req.method === "GET") {
       const sessions = db
         .prepare(
@@ -73,7 +83,47 @@ Bun.serve({
       `,
         )
         .all();
-      return Response.json(sessions);
+
+      const masteryStats = db
+        .prepare(
+          `
+        SELECT
+          SUM(CASE WHEN COALESCE(vm.box, 1) = 1 THEN 1 ELSE 0 END) as learning,
+          SUM(CASE WHEN vm.box = 2 THEN 1 ELSE 0 END) as reviewing,
+          SUM(CASE WHEN vm.box = 3 THEN 1 ELSE 0 END) as learned,
+          COUNT(v.id) as total
+        FROM vocab v
+        LEFT JOIN vocab_mastery vm ON v.id = vm.vocab_id
+      `,
+        )
+        .get();
+
+      return Response.json({ sessions, masteryStats });
+    }
+
+    // API: Delete Session
+    const deleteSessionMatch = pathname.match(/^\/api\/sessions\/(\d+)$/);
+    if (deleteSessionMatch && req.method === "DELETE") {
+      const sessionId = Number(deleteSessionMatch[1]);
+
+      db.transaction(() => {
+        db.prepare("DELETE FROM session_cards WHERE session_id = ?").run(
+          sessionId,
+        );
+        db.prepare("DELETE FROM sessions WHERE id = ?").run(sessionId);
+
+        // Check if any sessions remain
+        const count = db
+          .prepare("SELECT COUNT(*) as count FROM sessions")
+          .get() as { count: number };
+
+        // Clear all global mastery states if no sessions exist
+        if (count.count === 0) {
+          db.prepare("DELETE FROM vocab_mastery").run();
+        }
+      })();
+
+      return Response.json({ success: true });
     }
 
     // API: Resync Missing Words into Active Sessions
@@ -138,14 +188,14 @@ Bun.serve({
       }[];
       if (allVocab.length === 0) {
         return Response.json(
-          { error: "No vocabulary words found in database." },
+          { error: "No vocabulary words found." },
           { status: 400 },
         );
       }
 
       const shuffledVocab = shuffle([...allVocab]);
 
-      let sessionId: number = 0;
+      let sessionId = 0;
       db.transaction(() => {
         const res = db
           .prepare("INSERT INTO sessions (status) VALUES ('active')")
@@ -185,7 +235,13 @@ Bun.serve({
         LIMIT 1
       `,
         )
-        .get(sessionId);
+        .get(sessionId) as {
+        session_card_id: number;
+        vocab_id: number;
+        name: string;
+        text: string;
+        ref: string;
+      } | null;
 
       const stats = db
         .prepare(
@@ -201,10 +257,23 @@ Bun.serve({
         )
         .get(sessionId);
 
-      return Response.json({ card: nextCard || null, stats });
+      let options: string[] = [];
+      if (nextCard) {
+        const distractors = db
+          .prepare(
+            `
+          SELECT name FROM vocab WHERE id != ? ORDER BY RANDOM() LIMIT 3
+        `,
+          )
+          .all(nextCard.vocab_id) as { name: string }[];
+
+        options = shuffle([nextCard.name, ...distractors.map((d) => d.name)]);
+      }
+
+      return Response.json({ card: nextCard || null, stats, options });
     }
 
-    // API: Answer Card (Right or Wrong)
+    // API: Answer Card & Update Mastery Boxes
     const answerMatch = pathname.match(/^\/api\/cards\/(\d+)\/answer$/);
     if (answerMatch && req.method === "POST") {
       const sessionCardId = Number(answerMatch[1]);
@@ -212,30 +281,64 @@ Bun.serve({
         answer: "correct" | "incorrect";
       };
 
-      db.prepare("UPDATE session_cards SET status = ? WHERE id = ?").run(
-        answer,
-        sessionCardId,
-      );
-
-      const card = db
-        .prepare("SELECT session_id FROM session_cards WHERE id = ?")
-        .get(sessionCardId) as { session_id: number };
-      const remaining = db
-        .prepare(
-          "SELECT COUNT(*) as count FROM session_cards WHERE session_id = ? AND status = 'unseen'",
-        )
-        .get(card.session_id) as { count: number };
-
-      if (remaining.count === 0) {
-        db.prepare("UPDATE sessions SET status = 'completed' WHERE id = ?").run(
-          card.session_id,
+      db.transaction(() => {
+        db.prepare("UPDATE session_cards SET status = ? WHERE id = ?").run(
+          answer,
+          sessionCardId,
         );
-      }
+
+        const card = db
+          .prepare(
+            `
+          SELECT session_id, vocab_id FROM session_cards WHERE id = ?
+        `,
+          )
+          .get(sessionCardId) as { session_id: number; vocab_id: number };
+
+        const existingMastery = db
+          .prepare(
+            `
+          SELECT box FROM vocab_mastery WHERE vocab_id = ?
+        `,
+          )
+          .get(card.vocab_id) as { box: number } | null;
+
+        let newBox = 1;
+        if (answer === "correct") {
+          const currentBox = existingMastery ? existingMastery.box : 1;
+          newBox = Math.min(currentBox + 1, 3);
+        } else {
+          newBox = 1;
+        }
+
+        db.prepare(
+          `
+          INSERT INTO vocab_mastery (vocab_id, box, updated_at)
+          VALUES (?, ?, CURRENT_TIMESTAMP)
+          ON CONFLICT(vocab_id) DO UPDATE SET
+            box = excluded.box,
+            updated_at = CURRENT_TIMESTAMP
+        `,
+        ).run(card.vocab_id, newBox);
+
+        const remaining = db
+          .prepare(
+            `
+          SELECT COUNT(*) as count FROM session_cards WHERE session_id = ? AND status = 'unseen'
+        `,
+          )
+          .get(card.session_id) as { count: number };
+
+        if (remaining.count === 0) {
+          db.prepare(
+            "UPDATE sessions SET status = 'completed' WHERE id = ?",
+          ).run(card.session_id);
+        }
+      })();
 
       return Response.json({ success: true });
     }
 
-    // Serve HTML Dashboard Frontend
     if (pathname === "/") {
       return new Response(HTML_CONTENT, {
         headers: { "Content-Type": "text/html" },
@@ -247,15 +350,13 @@ Bun.serve({
 });
 
 console.log(`Flashcard App running at http://localhost:${PORT}`);
-
-// Inline Frontend HTML/CSS/JS
 const HTML_CONTENT = `
 <!DOCTYPE html>
 <html lang="en">
 <head>
   <meta charset="UTF-8">
   <meta name="viewport" content="width=device-width, initial-scale=1.0">
-  <title>GRE Flashcards</title>
+  <title>GRE Vocabulary Practice</title>
   <script src="https://cdn.jsdelivr.net/npm/marked/marked.min.js"></script>
   <style>
     :root {
@@ -266,6 +367,7 @@ const HTML_CONTENT = `
       --primary: #6366f1;
       --primary-hover: #4f46e5;
       --success: #22c55e;
+      --warning: #f59e0b;
       --danger: #ef4444;
       --border: #334155;
     }
@@ -282,8 +384,8 @@ const HTML_CONTENT = `
       background: var(--primary);
       color: white;
       border: none;
-      padding: 0.8rem 1.5rem;
-      font-size: 1rem;
+      padding: 0.75rem 1.25rem;
+      font-size: 0.95rem;
       font-weight: 600;
       border-radius: 8px;
       cursor: pointer;
@@ -292,9 +394,29 @@ const HTML_CONTENT = `
     .btn:hover { background: var(--primary-hover); }
     .btn-secondary { background: transparent; border: 1px solid var(--border); color: var(--text); }
     .btn-secondary:hover { background: var(--border); }
+    .btn-danger { background: transparent; border: 1px solid var(--danger); color: var(--danger); padding: 0.4rem 0.8rem; }
+    .btn-danger:hover { background: var(--danger); color: white; }
+
+    /* Mastery Tracker Bar */
+    .mastery-tracker {
+      display: grid;
+      grid-template-columns: repeat(3, 1fr);
+      gap: 0.75rem;
+      background: var(--card-bg);
+      border: 1px solid var(--border);
+      border-radius: 10px;
+      padding: 1rem;
+      margin-bottom: 1.5rem;
+      text-align: center;
+    }
+    .mastery-box .count { font-size: 1.5rem; font-weight: bold; }
+    .mastery-box.learning .count { color: var(--danger); }
+    .mastery-box.reviewing .count { color: var(--warning); }
+    .mastery-box.learned .count { color: var(--success); }
+    .mastery-box .label { font-size: 0.8rem; color: var(--muted); text-transform: uppercase; margin-top: 0.2rem; }
 
     /* Dashboard */
-    .dashboard { display: flex; flex-direction: column; gap: 1.5rem; }
+    .dashboard { display: flex; flex-direction: column; gap: 1rem; }
     .action-bar { display: flex; justify-content: space-between; align-items: center; }
     .button-group { display: flex; gap: 0.5rem; }
     .session-list { display: flex; flex-direction: column; gap: 0.75rem; }
@@ -306,15 +428,18 @@ const HTML_CONTENT = `
       display: flex;
       justify-content: space-between;
       align-items: center;
-      cursor: pointer;
     }
     .session-item:hover { border-color: var(--primary); }
     .badge { padding: 0.2rem 0.6rem; border-radius: 12px; font-size: 0.8rem; background: var(--border); }
     .badge.completed { background: var(--success); color: #000; }
 
-    /* Card View */
-    .card-view { display: none; flex-direction: column; gap: 1.5rem; }
+    /* Card Practice View */
+    .card-view { display: none; flex-direction: column; gap: 1.25rem; margin-top: 1rem; }
     .card-header { display: flex; justify-content: space-between; align-items: center; color: var(--muted); }
+    .mode-toggle { display: flex; gap: 0.5rem; background: var(--card-bg); padding: 0.2rem; border-radius: 8px; border: 1px solid var(--border); }
+    .mode-btn { background: transparent; border: none; color: var(--muted); padding: 0.4rem 0.8rem; border-radius: 6px; cursor: pointer; font-size: 0.85rem; }
+    .mode-btn.active { background: var(--primary); color: white; }
+
     .flashcard {
       background: var(--card-bg);
       border: 1px solid var(--border);
@@ -327,6 +452,8 @@ const HTML_CONTENT = `
       justify-content: center;
       text-align: center;
       box-shadow: 0 10px 25px -5px rgba(0,0,0,0.3);
+      width: 100%;
+      overflow-x: hidden;
     }
     .word { font-size: 2.5rem; font-weight: 700; margin-bottom: 1rem; color: #fff; }
     .markdown-content {
@@ -336,18 +463,36 @@ const HTML_CONTENT = `
       padding-top: 1.5rem;
       border-top: 1px solid var(--border);
       line-height: 1.6;
+      word-wrap: break-word;
+      overflow-wrap: break-word;
+      font-size: 1.2rem;
     }
     .markdown-content img { max-width: 100%; height: auto; border-radius: 8px; margin: 1rem 0; }
 
-    .actions { display: flex; gap: 1rem; justify-content: center; }
+    .actions { display: flex; gap: 1rem; justify-content: center; width: 100%; margin-top: 1rem; }
     .btn-right { background: var(--success); flex: 1; }
     .btn-wrong { background: var(--danger); flex: 1; }
+
+    /* Quiz Option Grid */
+    .quiz-options { display: grid; grid-template-columns: 1fr 1fr; gap: 0.75rem; width: 100%; margin-top: 1rem; }
+    .quiz-opt-btn {
+      background: var(--bg);
+      border: 1px solid var(--border);
+      color: var(--text);
+      padding: 1rem;
+      border-radius: 8px;
+      font-size: 1rem;
+      cursor: pointer;
+      text-align: center;
+      word-wrap: break-word;
+    }
+    .quiz-opt-btn:hover { border-color: var(--primary); }
 
     /* Completion View */
     .completion-view { display: none; text-align: center; padding: 3rem 1rem; }
     .score { font-size: 3rem; font-weight: bold; color: var(--success); margin: 1rem 0; }
 
-    /* Search Overlay & Modals */
+    /* Search & Modals */
     .modal-overlay {
       display: none;
       position: fixed;
@@ -406,8 +551,23 @@ const HTML_CONTENT = `
 
     <!-- Home View -->
     <div id="view-home" class="dashboard">
+      <div class="mastery-tracker">
+        <div class="mastery-box learning">
+          <div id="count-learning" class="count">0</div>
+          <div class="label">Learning</div>
+        </div>
+        <div class="mastery-box reviewing">
+          <div id="count-reviewing" class="count">0</div>
+          <div class="label">Reviewing</div>
+        </div>
+        <div class="mastery-box learned">
+          <div id="count-learned" class="count">0</div>
+          <div class="label">Learned</div>
+        </div>
+      </div>
+
       <div class="action-bar">
-        <h2>Practice Sessions</h2>
+        <h2>Sessions</h2>
         <div class="button-group">
           <button class="btn btn-secondary" onclick="openSearchModal()">🔍 Search</button>
           <button class="btn btn-secondary" onclick="resyncSessions()">🔄 Resync</button>
@@ -422,13 +582,24 @@ const HTML_CONTENT = `
       <div class="card-header">
         <button class="btn btn-secondary" onclick="showHome()">← Exit</button>
         <span id="progress-text">0/0</span>
-        <span id="ref-tag" class="badge">Part 1</span>
+        <div class="mode-toggle">
+          <button id="mode-flashcard" class="mode-btn active" onclick="setMode('flashcard')">Flashcard</button>
+          <button id="mode-quiz" class="mode-btn" onclick="setMode('quiz')">Multiple Choice</button>
+        </div>
       </div>
 
       <div class="flashcard">
+        <div id="card-prompt-label" style="display:none; color: var(--muted); font-size:0.9rem; margin-bottom: 0.5rem;">Select the matching vocabulary word:</div>
         <div id="card-word" class="word">Loading...</div>
-        <button id="btn-reveal" class="btn" onclick="revealCard()">Reveal Answer</button>
+
+        <!-- Markdown Definition -->
         <div id="card-answer" class="markdown-content" style="display: none;"></div>
+
+        <!-- Multiple Choice Options -->
+        <div id="quiz-container" class="quiz-options" style="display: none;"></div>
+
+        <!-- Reveal Button -->
+        <button id="btn-reveal" class="btn" style="margin-top: 1rem;" onclick="revealCard()">Reveal Answer</button>
       </div>
 
       <div id="answer-actions" class="actions" style="display: none;">
@@ -473,29 +644,44 @@ const HTML_CONTENT = `
   <script>
     let currentSessionId = null;
     let currentCard = null;
+    let currentOptions = [];
+    let practiceMode = 'flashcard';
 
     async function loadSessions() {
       const res = await fetch('/api/sessions');
-      const sessions = await res.json();
-      const listEl = document.getElementById('session-list');
+      const data = await res.json();
 
-      if (sessions.length === 0) {
+      document.getElementById('count-learning').innerText = data.masteryStats.learning || 0;
+      document.getElementById('count-reviewing').innerText = data.masteryStats.reviewing || 0;
+      document.getElementById('count-learned').innerText = data.masteryStats.learned || 0;
+
+      const listEl = document.getElementById('session-list');
+      if (data.sessions.length === 0) {
         listEl.innerHTML = '<p style="color: var(--muted); text-align: center;">No sessions started yet.</p>';
         return;
       }
 
-      listEl.innerHTML = sessions.map(s => \`
-        <div class="session-item" onclick="openSession(\${s.id})">
-          <div>
+      listEl.innerHTML = data.sessions.map(s => \`
+        <div class="session-item">
+          <div style="cursor: pointer; flex: 1;" onclick="openSession(\${s.id})">
             <strong>Session #\${s.id}</strong>
             <div style="font-size: 0.85rem; color: var(--muted)">\${new Date(s.created_at).toLocaleString()}</div>
           </div>
           <div style="display: flex; gap: 1rem; align-items: center;">
             <span>\${s.completed_cards} / \${s.total_cards}</span>
             <span class="badge \${s.status === 'completed' ? 'completed' : ''}">\${s.status}</span>
+            <button class="btn btn-danger" onclick="confirmDeleteSession(\${s.id}, event)">🗑️</button>
           </div>
         </div>
       \`).join('');
+    }
+
+    async function confirmDeleteSession(sessionId, event) {
+      event.stopPropagation();
+      if (confirm(\`Are you sure you want to delete Session #\${sessionId}?\`)) {
+        await fetch(\`/api/sessions/\${sessionId}\`, { method: 'DELETE' });
+        loadSessions();
+      }
     }
 
     async function resyncSessions() {
@@ -519,10 +705,16 @@ const HTML_CONTENT = `
       fetchNextCard();
     }
 
+    function setMode(mode) {
+      practiceMode = mode;
+      document.getElementById('mode-flashcard').classList.toggle('active', mode === 'flashcard');
+      document.getElementById('mode-quiz').classList.toggle('active', mode === 'quiz');
+      renderCardUI();
+    }
+
     async function fetchNextCard() {
       document.getElementById('card-answer').style.display = 'none';
       document.getElementById('answer-actions').style.display = 'none';
-      document.getElementById('btn-reveal').style.display = 'inline-block';
 
       const res = await fetch(\`/api/sessions/\${currentSessionId}/next\`);
       const data = await res.json();
@@ -535,14 +727,100 @@ const HTML_CONTENT = `
       }
 
       currentCard = data.card;
-      document.getElementById('card-word').innerText = currentCard.name;
-      document.getElementById('ref-tag').innerText = currentCard.ref;
+      currentOptions = data.options;
+      renderCardUI();
+    }
 
-      document.getElementById('card-answer').innerHTML = marked.parse(currentCard.text);
+    function renderCardUI() {
+      if (!currentCard) return;
+
+      const answerEl = document.getElementById('card-answer');
+
+      if (practiceMode === 'flashcard') {
+        // Flashcard Mode: Full Markdown text as-is
+        const fullMarkdown = currentCard.text + "\\n  <div style='margin-top: 1rem;' /> Reference: " + currentCard.ref;
+        answerEl.innerHTML = marked.parse(fullMarkdown);
+
+        document.getElementById('card-prompt-label').style.display = 'none';
+        document.getElementById('quiz-container').style.display = 'none';
+        document.getElementById('card-word').style.display = 'block';
+        document.getElementById('card-word').innerText = currentCard.name;
+        document.getElementById('card-answer').style.display = 'none';
+        document.getElementById('btn-reveal').style.display = 'inline-block';
+        document.getElementById('answer-actions').style.display = 'none';
+      } else {
+        // Multiple Choice Mode: Filter out spoiler lines & cut off content after 🧠 if followed by ---
+        let lines = currentCard.text.split('\\n');
+        let filteredLines = [];
+        let sawBrainEmoji = false;
+
+        for (const line of lines) {
+          const trimmed = line.trim();
+
+          // Cut off everything after the brain emoji section if a divider line is hit
+          if (sawBrainEmoji && /^---+$/.test(trimmed)) {
+            break;
+          }
+
+          if (trimmed.startsWith('🧠')) {
+            sawBrainEmoji = true;
+            continue;
+          }
+
+          // 1. Remove header line: "- **word**"
+          if (trimmed.startsWith('- **')) continue;
+
+          // 2. Remove Part of Speech lines: "noun", "adjective", "verb", "adverb"
+          const cleanPos = trimmed.replace(/[*_]/g, '').toLowerCase();
+          if (['noun', 'adjective', 'verb', 'adverb'].includes(cleanPos)) continue;
+
+          // 3. Remove Synonym / Antonym spoiler lines: "syn:", "sync:", "ant:"
+          if (/^(syn|sync|ant)\\s*:/i.test(trimmed)) continue;
+
+          filteredLines.push(line);
+        }
+
+        let quizText = filteredLines.join('\\n');
+
+        // Blank out exact word occurrences (case-insensitive)
+        const wordRegex = new RegExp(\`\\\\b\${currentCard.name}\\\\b\`, 'gi');
+        quizText = quizText.replace(wordRegex, '_____');
+
+        answerEl.innerHTML = marked.parse(quizText);
+
+        document.getElementById('card-prompt-label').style.display = 'block';
+        document.getElementById('card-word').style.display = 'none';
+        document.getElementById('btn-reveal').style.display = 'none';
+        document.getElementById('card-answer').style.display = 'block';
+        document.getElementById('answer-actions').style.display = 'none';
+
+        const quizContainer = document.getElementById('quiz-container');
+        quizContainer.style.display = 'grid';
+        quizContainer.innerHTML = currentOptions.map(opt => {
+          const safeOpt = opt.replace(/'/g, "\\\\'");
+          return \`<button class="quiz-opt-btn" onclick="checkQuizAnswer('\${safeOpt}')">\${opt}</button>\`;
+        }).join('');
+      }
+    }
+
+    function checkQuizAnswer(selectedWord) {
+      revealCard();
+      if (selectedWord === currentCard.name) {
+        alert("Correct! 🎉");
+      } else {
+        alert(\`Incorrect. The correct word was: \${currentCard.name}\`);
+      }
     }
 
     function revealCard() {
+      const answerEl = document.getElementById('card-answer');
+      const fullMarkdown = currentCard.text + "\\n <div style='margin-top: 1rem;' /> Reference: " + currentCard.ref;
+      answerEl.innerHTML = marked.parse(fullMarkdown);
+
       document.getElementById('btn-reveal').style.display = 'none';
+      document.getElementById('card-word').style.display = 'block';
+      document.getElementById('card-word').innerText = currentCard.name;
+      document.getElementById('quiz-container').style.display = 'none';
       document.getElementById('card-answer').style.display = 'block';
       document.getElementById('answer-actions').style.display = 'flex';
     }
@@ -581,7 +859,7 @@ const HTML_CONTENT = `
       document.getElementById('search-results-list').innerHTML = '';
     }
 
-    function closeSearchModal(e) {
+    function closeSearchModal() {
       document.getElementById('modal-search').style.display = 'none';
     }
 
