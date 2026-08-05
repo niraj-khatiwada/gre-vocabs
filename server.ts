@@ -34,6 +34,26 @@ Bun.serve({
       return new Response("Image not found", { status: 404 });
     }
 
+    // API: Vocabulary Search
+    if (pathname === "/api/search" && req.method === "GET") {
+      const query = url.searchParams.get("q") || "";
+      if (!query.trim()) {
+        return Response.json([]);
+      }
+      const results = db
+        .prepare(
+          `
+        SELECT id, name, ref, text
+        FROM vocab
+        WHERE name LIKE ? OR text LIKE ?
+        LIMIT 20
+      `,
+        )
+        .all(`%${query}%`, `%${query}%`);
+
+      return Response.json(results);
+    }
+
     // API: Get List of All Sessions
     if (pathname === "/api/sessions" && req.method === "GET") {
       const sessions = db
@@ -65,7 +85,6 @@ Bun.serve({
 
       db.transaction(() => {
         for (const session of activeSessions) {
-          // Find vocabulary IDs missing from this session
           const missingVocab = db
             .prepare(
               `
@@ -79,7 +98,6 @@ Bun.serve({
             .all(session.id) as { id: number }[];
 
           if (missingVocab.length > 0) {
-            // Get current max card_order for the session
             const maxOrderRow = db
               .prepare(
                 `
@@ -199,7 +217,6 @@ Bun.serve({
         sessionCardId,
       );
 
-      // Check if session completed
       const card = db
         .prepare("SELECT session_id FROM session_cards WHERE id = ?")
         .get(sessionCardId) as { session_id: number };
@@ -319,7 +336,6 @@ const HTML_CONTENT = `
       padding-top: 1.5rem;
       border-top: 1px solid var(--border);
       line-height: 1.6;
-      font-size: 1.2rem;
     }
     .markdown-content img { max-width: 100%; height: auto; border-radius: 8px; margin: 1rem 0; }
 
@@ -330,6 +346,55 @@ const HTML_CONTENT = `
     /* Completion View */
     .completion-view { display: none; text-align: center; padding: 3rem 1rem; }
     .score { font-size: 3rem; font-weight: bold; color: var(--success); margin: 1rem 0; }
+
+    /* Search Overlay & Modals */
+    .modal-overlay {
+      display: none;
+      position: fixed;
+      top: 0; left: 0; right: 0; bottom: 0;
+      background: rgba(15, 23, 42, 0.85);
+      backdrop-filter: blur(4px);
+      z-index: 100;
+      justify-content: center;
+      align-items: flex-start;
+      padding-top: 5rem;
+    }
+    .modal-content {
+      background: var(--card-bg);
+      border: 1px solid var(--border);
+      border-radius: 12px;
+      width: 100%;
+      max-width: 600px;
+      padding: 1.5rem;
+      display: flex;
+      flex-direction: column;
+      gap: 1rem;
+      box-shadow: 0 20px 25px -5px rgba(0,0,0,0.5);
+      max-height: 80vh;
+      overflow-y: auto;
+    }
+    .search-input {
+      width: 100%;
+      padding: 0.8rem 1rem;
+      background: var(--bg);
+      border: 1px solid var(--border);
+      color: var(--text);
+      border-radius: 8px;
+      font-size: 1.1rem;
+    }
+    .search-input:focus { outline: none; border-color: var(--primary); }
+    .search-results { display: flex; flex-direction: column; gap: 0.5rem; }
+    .result-item {
+      padding: 0.8rem 1rem;
+      background: var(--bg);
+      border: 1px solid var(--border);
+      border-radius: 6px;
+      cursor: pointer;
+      display: flex;
+      justify-content: space-between;
+      align-items: center;
+    }
+    .result-item:hover { border-color: var(--primary); }
   </style>
 </head>
 <body>
@@ -344,6 +409,7 @@ const HTML_CONTENT = `
       <div class="action-bar">
         <h2>Practice Sessions</h2>
         <div class="button-group">
+          <button class="btn btn-secondary" onclick="openSearchModal()">🔍 Search</button>
           <button class="btn btn-secondary" onclick="resyncSessions()">🔄 Resync</button>
           <button class="btn" onclick="startNewSession()">+ New Session</button>
         </div>
@@ -377,6 +443,30 @@ const HTML_CONTENT = `
       <div id="final-score" class="score">0%</div>
       <p id="final-stats" style="color: var(--muted); margin-bottom: 2rem;"></p>
       <button class="btn" onclick="showHome()">Return to Dashboard</button>
+    </div>
+  </div>
+
+  <!-- Search Modal -->
+  <div id="modal-search" class="modal-overlay" onclick="closeSearchModal(event)">
+    <div class="modal-content" onclick="event.stopPropagation()">
+      <div style="display: flex; justify-content: space-between; align-items: center;">
+        <h3>Search Vocabulary</h3>
+        <button class="btn btn-secondary" style="padding: 0.3rem 0.8rem;" onclick="closeSearchModal()">Esc</button>
+      </div>
+      <input type="text" id="search-query" class="search-input" placeholder="Type a word..." oninput="handleSearch(this.value)" autofocus />
+      <div id="search-results-list" class="search-results"></div>
+    </div>
+  </div>
+
+  <!-- Word Detail Modal -->
+  <div id="modal-word-detail" class="modal-overlay" onclick="closeWordModal(event)">
+    <div class="modal-content" onclick="event.stopPropagation()">
+      <div style="display: flex; justify-content: space-between; align-items: center;">
+        <span id="detail-ref" class="badge">Part 1</span>
+        <button class="btn btn-secondary" style="padding: 0.3rem 0.8rem;" onclick="closeWordModal()">Close</button>
+      </div>
+      <h2 id="detail-word-title" style="font-size: 2rem; margin-top: 0.5rem;">Word</h2>
+      <div id="detail-markdown" class="markdown-content" style="border-top: 1px solid var(--border); margin-top: 0.5rem;"></div>
     </div>
   </div>
 
@@ -480,6 +570,56 @@ const HTML_CONTENT = `
       document.getElementById('view-practice').style.display = 'none';
       document.getElementById('view-complete').style.display = 'none';
       loadSessions();
+    }
+
+    /* Search UI Functions */
+    function openSearchModal() {
+      document.getElementById('modal-search').style.display = 'flex';
+      const input = document.getElementById('search-query');
+      input.value = '';
+      input.focus();
+      document.getElementById('search-results-list').innerHTML = '';
+    }
+
+    function closeSearchModal(e) {
+      document.getElementById('modal-search').style.display = 'none';
+    }
+
+    let searchTimeout = null;
+    function handleSearch(query) {
+      clearTimeout(searchTimeout);
+      searchTimeout = setTimeout(async () => {
+        if (!query.trim()) {
+          document.getElementById('search-results-list').innerHTML = '';
+          return;
+        }
+        const res = await fetch(\`/api/search?q=\${encodeURIComponent(query)}\`);
+        const results = await res.json();
+        const resultsList = document.getElementById('search-results-list');
+
+        if (results.length === 0) {
+          resultsList.innerHTML = '<p style="color: var(--muted); text-align: center; padding: 1rem;">No matching words found.</p>';
+          return;
+        }
+
+        resultsList.innerHTML = results.map(item => \`
+          <div class="result-item" onclick="openWordDetail(\${JSON.stringify(item).replace(/"/g, '&quot;')})">
+            <strong>\${item.name}</strong>
+            <span class="badge">\${item.ref}</span>
+          </div>
+        \`).join('');
+      }, 200);
+    }
+
+    function openWordDetail(wordData) {
+      document.getElementById('detail-word-title').innerText = wordData.name;
+      document.getElementById('detail-ref').innerText = wordData.ref;
+      document.getElementById('detail-markdown').innerHTML = marked.parse(wordData.text);
+      document.getElementById('modal-word-detail').style.display = 'flex';
+    }
+
+    function closeWordModal() {
+      document.getElementById('modal-word-detail').style.display = 'none';
     }
 
     loadSessions();
