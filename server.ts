@@ -1,7 +1,9 @@
 import { Database } from "bun:sqlite";
 import { join } from "path";
 
-const db = new Database("vocab.sqlite");
+const dbPath =
+  Bun.env.NODE_ENV === "production" ? "/app/data/vocab.sqlite" : "vocab.sqlite";
+const db = new Database(dbPath);
 
 // Initialize Schema Additions
 db.run(`
@@ -23,9 +25,10 @@ function shuffle<T>(array: T[]): T[] {
   return array;
 }
 
-const PORT = 3000;
+const PORT = 8080;
 
 Bun.serve({
+  hostname: "0.0.0.0",
   port: PORT,
   async fetch(req) {
     const url = new URL(req.url);
