@@ -5,7 +5,7 @@ import { basename, join } from "path";
 // Initialize SQLite database
 const db = new Database("vocab.sqlite", { create: true });
 
-// Create schema with the new `ref` column and a UNIQUE constraint on `name`
+// Create schema
 db.run(`
   CREATE TABLE IF NOT EXISTS vocab (
     id INTEGER PRIMARY KEY AUTOINCREMENT,
@@ -14,6 +14,26 @@ db.run(`
     text TEXT NOT NULL,
     created_at DATETIME DEFAULT CURRENT_TIMESTAMP,
     updated_at DATETIME DEFAULT CURRENT_TIMESTAMP
+  );
+`);
+
+db.run(`
+  CREATE TABLE IF NOT EXISTS sessions (
+    id INTEGER PRIMARY KEY AUTOINCREMENT,
+    created_at DATETIME DEFAULT CURRENT_TIMESTAMP,
+    status TEXT DEFAULT 'active' -- 'active' or 'completed'
+  );
+`);
+
+db.run(`
+  CREATE TABLE IF NOT EXISTS session_cards (
+    id INTEGER PRIMARY KEY AUTOINCREMENT,
+    session_id INTEGER NOT NULL,
+    vocab_id INTEGER NOT NULL,
+    card_order INTEGER NOT NULL,
+    status TEXT DEFAULT 'unseen', -- 'unseen', 'correct', 'incorrect'
+    FOREIGN KEY(session_id) REFERENCES sessions(id),
+    FOREIGN KEY(vocab_id) REFERENCES vocab(id)
   );
 `);
 
@@ -30,14 +50,11 @@ const upsertVocab = db.prepare(`
 const ROOT_DIR = ".";
 const GRE_DIR = join(ROOT_DIR, "GRE");
 
-// Helper function to extract friendly ref name (e.g., "Part 1 35822e...md" -> "Part 1")
 function getFriendlyRefName(filePath: string): string {
   const fileName = basename(filePath, ".md");
-  // Strips off the Notion hex/UUID string at the end (e.g., " 35822e6065d6805fbb01eaadfbb84845")
   return fileName.replace(/\s+[a-f0-9]{32}$/i, "").trim();
 }
 
-// Step 1: Find the main index markdown file (e.g., GRE 35722e...md)
 const rootFiles = Array.from(new Bun.Glob("GRE*.md").scanSync(ROOT_DIR));
 if (rootFiles.length === 0) {
   console.error("Error: Could not find the main GRE index markdown file.");
@@ -47,7 +64,6 @@ if (rootFiles.length === 0) {
 const mainIndexFile = rootFiles[0];
 console.log(`Found index file: ${mainIndexFile}`);
 
-// Step 2: Extract ordered links from the index file
 const indexContent = readFileSync(mainIndexFile, "utf-8");
 const markdownLinkRegex = /\[([^\]]+)\]\((GRE\/[^\)]+\.md)\)/g;
 
@@ -63,7 +79,6 @@ while ((match = markdownLinkRegex.exec(indexContent)) !== null) {
   }
 }
 
-// Step 3: Discover any extra .md files inside GRE/ folder not linked in the index
 if (existsSync(GRE_DIR)) {
   const allGreFiles = Array.from(new Bun.Glob("*.md").scanSync(GRE_DIR));
   for (const file of allGreFiles) {
@@ -75,11 +90,6 @@ if (existsSync(GRE_DIR)) {
   }
 }
 
-console.log(
-  `Total Markdown files queued for processing: ${orderedPaths.length}`,
-);
-
-// Step 4: Parse files and UPSERT records into SQLite
 let processedCount = 0;
 
 db.transaction(() => {
@@ -91,21 +101,17 @@ db.transaction(() => {
 
     const refName = getFriendlyRefName(partPath);
     const content = readFileSync(partPath, "utf-8");
-
-    // Split entries by bullet point toggle headers (- **word**)
     const entries = content.split(/\n(?=- \*\*)/);
 
     for (const entry of entries) {
       const trimmed = entry.trim();
       if (!trimmed) continue;
 
-      // Extract vocabulary name from "- **word**"
       const headerMatch = trimmed.match(/^- \*\*([^*]+)\*\*/);
       if (!headerMatch) continue;
 
       const wordName = headerMatch[1].trim();
 
-      // Upsert into SQLite
       upsertVocab.run({
         $name: wordName,
         $ref: refName,
