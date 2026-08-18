@@ -2,7 +2,7 @@
 
 - **qualify**
     
-    *verb*  
+    *verb*
     
     Meaning 1: To meet the standard
     

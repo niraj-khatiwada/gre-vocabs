@@ -6,7 +6,7 @@
     
     to exclude, reject, or deliberately keep someone away from a group or society.
     
-    syn; **shun; secluded; banish; alienate; insular**
+    syn: **shun; secluded; banish; alienate; insular**
     
     🧠 ostracize = imagine ostrich are placed separately in a zoo because they attack people = isolated
     
@@ -38,11 +38,21 @@
     
     🧠 plucky = pluck the bravery
     
+- **mettlesome**
+    
+    *adjective*
+    
+    brave; full of energy
+    
+    syn: **intrepid; plucky; hardy** (yes like Tom Hardy)
+    
+    🧠 mettlesome = metal + some = hard & brave
+    
 - **foment**
     
     *verb*
     
-    To stir up, encourage, or provoke something—especially something negative like trouble, conflict, rebellion, or unrest.
+    to stir up, encourage, or provoke something—especially something negative like trouble, conflict, rebellion, or unrest.
     
     syn: **incite; agitate; inflame; provoke**
     
@@ -90,7 +100,7 @@
     
     *noun*
     
-     an award or praise granted as a special honor
+    an award or praise granted as a special honor
     
     🧠 accolade = sounds similar to applaud = honor/award
     
@@ -125,6 +135,8 @@
     syn: **stray; wander; drift**
     
     🧠 digress = diverge+great = deviate from main topic
+    
+    🧠 **di**gression = divert from gre session = you keep getting way from gre study(main topic)
     
 - **inveterate**
     
@@ -162,6 +174,8 @@
     
     revel
     
+    ![image.png](Part%2075/image%201.png)
+    
 - **merrymaking**
     
     *adjective*
@@ -169,3 +183,5 @@
     syn: **revelry**
     
     🧠 merrymaking = marry + making = boisterous celebration
+    
+    🧠 merrymaking = merry(happy & cheerful)+making = celebration
