@@ -204,50 +204,52 @@ Bun.serve({
 
     // API: Start a New Session
     if (pathname === "/api/sessions" && req.method === "POST") {
-      const allVocab = db
-        .prepare(
-          `
-        SELECT v.id, COALESCE(vm.box, 1) as box
-        FROM vocab v
-        LEFT JOIN vocab_mastery vm ON v.id = vm.vocab_id
-      `,
-        )
-        .all() as { id: number; box: number }[];
-      if (allVocab.length === 0) {
-        return Response.json(
-          { error: "No vocabulary words found." },
-          { status: 400 },
-        );
-      }
+      if (pathname === "/api/sessions" && req.method === "POST") {
+        const activeVocab = db
+          .prepare(
+            `
+          SELECT v.id, COALESCE(vm.box, 1) as box
+          FROM vocab v
+          LEFT JOIN vocab_mastery vm ON v.id = vm.vocab_id
+          WHERE COALESCE(vm.box, 1) < 3
+        `,
+          )
+          .all() as { id: number; box: number }[];
 
-      // Prioritize words in box 1 (learning), then box 2, then box 3
-      const box1 = shuffle(allVocab.filter((v) => v.box === 1));
-      const box2 = shuffle(allVocab.filter((v) => v.box === 2));
-      const box3 = shuffle(allVocab.filter((v) => v.box === 3));
-      const shuffledVocab = [...box1, ...box2, ...box3];
+        if (activeVocab.length === 0) {
+          return Response.json(
+            { message: "All words have been mastered!" },
+            { status: 200 },
+          );
+        }
 
-      let sessionId = 0;
-      db.transaction(() => {
-        const res = db
-          .prepare("INSERT INTO sessions (status) VALUES ('active')")
-          .run();
-        sessionId = Number(res.lastInsertRowid);
+        const box1 = shuffle(activeVocab.filter((v) => v.box === 1));
+        const box2 = shuffle(activeVocab.filter((v) => v.box === 2));
+        const shuffledVocab = shuffle([...box1, ...box2]);
 
-        const insertCard = db.prepare(`
-          INSERT INTO session_cards (session_id, vocab_id, card_order, status)
-          VALUES ($session_id, $vocab_id, $card_order, 'unseen')
-        `);
+        let sessionId = 0;
+        db.transaction(() => {
+          const res = db
+            .prepare("INSERT INTO sessions (status) VALUES ('active')")
+            .run();
+          sessionId = Number(res.lastInsertRowid);
 
-        shuffledVocab.forEach((item, index) => {
-          insertCard.run({
-            $session_id: sessionId,
-            $vocab_id: item.id,
-            $card_order: index,
+          const insertCard = db.prepare(`
+            INSERT INTO session_cards (session_id, vocab_id, card_order, status)
+            VALUES ($session_id, $vocab_id, $card_order, 'unseen')
+          `);
+
+          shuffledVocab.forEach((item, index) => {
+            insertCard.run({
+              $session_id: sessionId,
+              $vocab_id: item.id,
+              $card_order: index,
+            });
           });
-        });
-      })();
+        })();
 
-      return Response.json({ id: sessionId });
+        return Response.json({ id: sessionId });
+      }
     }
 
     // API: Get Next Unseen Card in Session
