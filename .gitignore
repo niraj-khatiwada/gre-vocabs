@@ -1,8 +1,4 @@
-.git
-.gitignore
 node_modules
-.DS_Store
-*.sqlite-journal
 *.sqlite
 *.sqlite-wal
 *.sqlite-shm

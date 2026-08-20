@@ -9,7 +9,7 @@ const db = new Database("vocab.sqlite", { create: true });
 db.run(`
   CREATE TABLE IF NOT EXISTS vocab (
     id INTEGER PRIMARY KEY AUTOINCREMENT,
-    name TEXT NOT NULL UNIQUE,
+    name TEXT NOT NULL,
     ref TEXT NOT NULL,
     text TEXT NOT NULL,
     created_at DATETIME DEFAULT CURRENT_TIMESTAMP,
@@ -41,10 +41,6 @@ db.run(`
 const upsertVocab = db.prepare(`
   INSERT INTO vocab (name, ref, text, created_at, updated_at)
   VALUES ($name, $ref, $text, CURRENT_TIMESTAMP, CURRENT_TIMESTAMP)
-  ON CONFLICT(name) DO UPDATE SET
-    ref = excluded.ref,
-    text = excluded.text,
-    updated_at = CURRENT_TIMESTAMP
 `);
 
 const ROOT_DIR = ".";

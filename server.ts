@@ -1,8 +1,26 @@
 import { Database } from "bun:sqlite";
 import { join } from "path";
+import { existsSync } from "fs";
 
 const dbPath =
   Bun.env.NODE_ENV === "production" ? "/app/data/vocab.sqlite" : "vocab.sqlite";
+
+if (!existsSync(dbPath)) {
+  console.log(`Database file not found at ${dbPath}. Executing migrate.ts...`);
+
+  const migration = Bun.spawnSync(["bun", "./migrate.ts"], {
+    stdout: "inherit",
+    stderr: "inherit",
+  });
+
+  if (migration.exitCode !== 0) {
+    console.error("Migration failed! Halting startup.");
+    process.exit(1);
+  }
+
+  console.log("Migration finished successfully.");
+}
+
 const db = new Database(dbPath);
 
 // Initialize Schema Additions
