@@ -16,6 +16,12 @@ db.run(`
   );
 `);
 
+try {
+  db.run(`ALTER TABLE session_cards ADD COLUMN attempted INTEGER DEFAULT 0`);
+} catch {
+  // already ran
+}
+
 // Fisher-Yates Shuffle Helper
 function shuffle<T>(array: T[]): T[] {
   for (let i = array.length - 1; i > 0; i--) {
@@ -36,15 +42,17 @@ Bun.serve({
 
     // Serve Local Images from GRE/ folder
     if (pathname.match(/\.(png|jpg|jpeg|gif|webp)$/i)) {
-      const imagePath = join(
-        process.cwd(),
-        "GRE",
-        decodeURIComponent(pathname),
-      );
+      // Strip leading slash to prevent join() from treat it as root path
+      const relativePath = decodeURIComponent(pathname).replace(/^\//, "");
+      const imagePath = join(process.cwd(), `/GRE/${relativePath}`);
+
+      console.log(imagePath);
+
       const file = Bun.file(imagePath);
       if (await file.exists()) {
         return new Response(file);
       }
+
       return new Response("Image not found", { status: 404 });
     }
 
@@ -77,7 +85,7 @@ Bun.serve({
           s.created_at,
           s.status,
           COUNT(sc.id) as total_cards,
-          SUM(CASE WHEN sc.status != 'unseen' THEN 1 ELSE 0 END) as completed_cards,
+          SUM(CASE WHEN sc.attempted = 1 THEN 1 ELSE 0 END) as attempted_cards,
           SUM(CASE WHEN sc.status = 'correct' THEN 1 ELSE 0 END) as correct_cards
         FROM sessions s
         LEFT JOIN session_cards sc ON s.id = sc.session_id
@@ -184,11 +192,27 @@ Bun.serve({
       return Response.json({ success: true, added_cards: totalAdded });
     }
 
+    // API: Reset All Progress
+    if (pathname === "/api/sessions/reset" && req.method === "POST") {
+      db.transaction(() => {
+        db.prepare("DELETE FROM session_cards").run();
+        db.prepare("DELETE FROM sessions").run();
+        db.prepare("DELETE FROM vocab_mastery").run();
+      })();
+      return Response.json({ success: true });
+    }
+
     // API: Start a New Session
     if (pathname === "/api/sessions" && req.method === "POST") {
-      const allVocab = db.prepare("SELECT id FROM vocab").all() as {
-        id: number;
-      }[];
+      const allVocab = db
+        .prepare(
+          `
+        SELECT v.id, COALESCE(vm.box, 1) as box
+        FROM vocab v
+        LEFT JOIN vocab_mastery vm ON v.id = vm.vocab_id
+      `,
+        )
+        .all() as { id: number; box: number }[];
       if (allVocab.length === 0) {
         return Response.json(
           { error: "No vocabulary words found." },
@@ -196,7 +220,11 @@ Bun.serve({
         );
       }
 
-      const shuffledVocab = shuffle([...allVocab]);
+      // Prioritize words in box 1 (learning), then box 2, then box 3
+      const box1 = shuffle(allVocab.filter((v) => v.box === 1));
+      const box2 = shuffle(allVocab.filter((v) => v.box === 2));
+      const box3 = shuffle(allVocab.filter((v) => v.box === 3));
+      const shuffledVocab = [...box1, ...box2, ...box3];
 
       let sessionId = 0;
       db.transaction(() => {
@@ -251,9 +279,8 @@ Bun.serve({
           `
         SELECT
           COUNT(*) as total,
-          SUM(CASE WHEN status != 'unseen' THEN 1 ELSE 0 END) as completed,
-          SUM(CASE WHEN status = 'correct' THEN 1 ELSE 0 END) as correct,
-          SUM(CASE WHEN status = 'incorrect' THEN 1 ELSE 0 END) as incorrect
+          SUM(CASE WHEN attempted = 1 THEN 1 ELSE 0 END) as attempted,
+          SUM(CASE WHEN status = 'correct' THEN 1 ELSE 0 END) as correct
         FROM session_cards
         WHERE session_id = ?
       `,
@@ -285,8 +312,7 @@ Bun.serve({
       };
 
       db.transaction(() => {
-        db.prepare("UPDATE session_cards SET status = ? WHERE id = ?").run(
-          answer,
+        db.prepare("UPDATE session_cards SET attempted = 1 WHERE id = ?").run(
           sessionCardId,
         );
 
@@ -297,6 +323,21 @@ Bun.serve({
         `,
           )
           .get(sessionCardId) as { session_id: number; vocab_id: number };
+
+        if (answer === "correct") {
+          db.prepare(
+            "UPDATE session_cards SET status = 'correct' WHERE id = ?",
+          ).run(sessionCardId);
+        } else {
+          const maxOrder = db
+            .prepare(
+              `SELECT COALESCE(MAX(card_order), -1) as max_order FROM session_cards WHERE session_id = ?`,
+            )
+            .get(card.session_id) as { max_order: number };
+          db.prepare(
+            "UPDATE session_cards SET status = 'unseen', card_order = ? WHERE id = ?",
+          ).run(maxOrder.max_order + 1, sessionCardId);
+        }
 
         const existingMastery = db
           .prepare(
@@ -543,6 +584,25 @@ const HTML_CONTENT = `
       align-items: center;
     }
     .result-item:hover { border-color: var(--primary); }
+
+    /* Loading Spinner */
+    @keyframes spin { to { transform: rotate(360deg); } }
+    .spinner {
+      width: 32px; height: 32px;
+      border: 3px solid var(--border);
+      border-top-color: var(--primary);
+      border-radius: 50%;
+      animation: spin 0.6s linear infinite;
+      margin: 2rem auto;
+    }
+    .spinner-sm {
+      width: 16px; height: 16px;
+      border-width: 2px;
+      display: inline-block;
+      vertical-align: middle;
+      margin-right: 0.4rem;
+    }
+    .btn:disabled { opacity: 0.5; cursor: not-allowed; }
   </style>
 </head>
 <body>
@@ -572,12 +632,13 @@ const HTML_CONTENT = `
       <div class="action-bar">
         <h2>Sessions</h2>
         <div class="button-group">
+          <button class="btn btn-danger" onclick="resetAll()">Reset All</button>
           <button class="btn btn-secondary" onclick="openSearchModal()">🔍 Search</button>
           <button class="btn btn-secondary" onclick="resyncSessions()">🔄 Resync</button>
           <button class="btn" onclick="startNewSession()">+ New Session</button>
         </div>
       </div>
-      <div id="session-list" class="session-list"></div>
+      <div id="session-list" class="session-list"><div class="spinner"></div></div>
     </div>
 
     <!-- Practice View -->
@@ -651,6 +712,9 @@ const HTML_CONTENT = `
     let practiceMode = 'flashcard';
 
     async function loadSessions() {
+      const listEl = document.getElementById('session-list');
+      listEl.innerHTML = '<div class="spinner"></div>';
+
       const res = await fetch('/api/sessions');
       const data = await res.json();
 
@@ -658,7 +722,6 @@ const HTML_CONTENT = `
       document.getElementById('count-reviewing').innerText = data.masteryStats.reviewing || 0;
       document.getElementById('count-learned').innerText = data.masteryStats.learned || 0;
 
-      const listEl = document.getElementById('session-list');
       if (data.sessions.length === 0) {
         listEl.innerHTML = '<p style="color: var(--muted); text-align: center;">No sessions started yet.</p>';
         return;
@@ -671,7 +734,7 @@ const HTML_CONTENT = `
             <div style="font-size: 0.85rem; color: var(--muted)">\${new Date(s.created_at).toLocaleString()}</div>
           </div>
           <div style="display: flex; gap: 1rem; align-items: center;">
-            <span>\${s.completed_cards} / \${s.total_cards}</span>
+            <span>\${s.attempted_cards} / \${s.total_cards}</span>
             <span class="badge \${s.status === 'completed' ? 'completed' : ''}">\${s.status}</span>
             <button class="btn btn-danger" onclick="confirmDeleteSession(\${s.id}, event)">🗑️</button>
           </div>
@@ -682,22 +745,53 @@ const HTML_CONTENT = `
     async function confirmDeleteSession(sessionId, event) {
       event.stopPropagation();
       if (confirm(\`Are you sure you want to delete Session #\${sessionId}?\`)) {
+        event.target.disabled = true;
         await fetch(\`/api/sessions/\${sessionId}\`, { method: 'DELETE' });
-        loadSessions();
+        location.reload();
       }
     }
 
     async function resyncSessions() {
-      const res = await fetch('/api/sessions/resync', { method: 'POST' });
-      const data = await res.json();
-      alert(\`Resynced! Added \${data.added_cards} new card(s) across active sessions.\`);
-      loadSessions();
+      const btn = event.target;
+      btn.disabled = true;
+      btn.innerHTML = '<span class="spinner spinner-sm"></span>Syncing...';
+      try {
+        const res = await fetch('/api/sessions/resync', { method: 'POST' });
+        const data = await res.json();
+        alert(\`Resynced! Added \${data.added_cards} new card(s) across active sessions.\`);
+        loadSessions();
+      } finally {
+        btn.disabled = false;
+        btn.innerHTML = '🔄 Resync';
+      }
+    }
+
+    async function resetAll() {
+      if (!confirm('Are you sure you want to delete ALL sessions and progress? This cannot be undone.')) return;
+      const btn = event.target;
+      btn.disabled = true;
+      btn.innerHTML = '<span class="spinner spinner-sm"></span>Resetting...';
+      try {
+        await fetch('/api/sessions/reset', { method: 'POST' });
+        location.reload();
+      } finally {
+        btn.disabled = false;
+        btn.innerHTML = 'Reset All';
+      }
     }
 
     async function startNewSession() {
-      const res = await fetch('/api/sessions', { method: 'POST' });
-      const data = await res.json();
-      openSession(data.id);
+      const btn = event.target;
+      btn.disabled = true;
+      btn.innerHTML = '<span class="spinner spinner-sm"></span>Creating...';
+      try {
+        const res = await fetch('/api/sessions', { method: 'POST' });
+        const data = await res.json();
+        openSession(data.id);
+      } finally {
+        btn.disabled = false;
+        btn.innerHTML = '+ New Session';
+      }
     }
 
     async function openSession(id) {
@@ -718,11 +812,15 @@ const HTML_CONTENT = `
     async function fetchNextCard() {
       document.getElementById('card-answer').style.display = 'none';
       document.getElementById('answer-actions').style.display = 'none';
+      document.getElementById('btn-reveal').style.display = 'none';
+      document.getElementById('quiz-container').style.display = 'none';
+      document.getElementById('card-word').style.display = 'block';
+      document.getElementById('card-word').innerText = 'Loading...';
 
       const res = await fetch(\`/api/sessions/\${currentSessionId}/next\`);
       const data = await res.json();
 
-      document.getElementById('progress-text').innerText = \`\${data.stats.completed}/\${data.stats.total}\`;
+      document.getElementById('progress-text').innerText = \`\${data.stats.attempted}/\${data.stats.total}\`;
 
       if (!data.card) {
         showCompletion(data.stats);
@@ -737,19 +835,25 @@ const HTML_CONTENT = `
     function renderCardUI() {
       if (!currentCard) return;
 
+      const wordEl = document.getElementById('card-word');
       const answerEl = document.getElementById('card-answer');
 
+      // Always update the word first
+      wordEl.innerText = currentCard.name;
+      wordEl.style.display = 'block';
+
       if (practiceMode === 'flashcard') {
-        // Flashcard Mode: Full Markdown text as-is
-        const fullMarkdown = currentCard.text + "\\n  <div style='margin-top: 1rem;' /> Reference: " + currentCard.ref;
-        answerEl.innerHTML = marked.parse(fullMarkdown);
+        try {
+          const fullMarkdown = currentCard.text + "\\n  <div style='margin-top: 1rem;' /> Reference: " + currentCard.ref;
+          answerEl.innerHTML = marked.parse(fullMarkdown);
+        } catch(e) {
+          answerEl.innerText = currentCard.text;
+        }
 
         document.getElementById('card-prompt-label').style.display = 'none';
         document.getElementById('quiz-container').style.display = 'none';
-        document.getElementById('card-word').style.display = 'block';
-        document.getElementById('card-word').innerText = currentCard.name;
-        document.getElementById('card-answer').style.display = 'none';
         document.getElementById('btn-reveal').style.display = 'inline-block';
+        answerEl.style.display = 'none';
         document.getElementById('answer-actions').style.display = 'none';
       } else {
         // Multiple Choice Mode: Filter out spoiler lines & cut off content after 🧠 if followed by ---
@@ -817,25 +921,36 @@ const HTML_CONTENT = `
 
     function revealCard() {
       const answerEl = document.getElementById('card-answer');
-      const fullMarkdown = currentCard.text + "\\n <div style='margin-top: 1rem;' /> Reference: " + currentCard.ref;
-      answerEl.innerHTML = marked.parse(fullMarkdown);
+      try {
+        const fullMarkdown = currentCard.text + "\\n <div style='margin-top: 1rem;' /> Reference: " + currentCard.ref;
+        answerEl.innerHTML = marked.parse(fullMarkdown);
+      } catch(e) {
+        answerEl.innerText = currentCard.text;
+      }
 
       document.getElementById('btn-reveal').style.display = 'none';
       document.getElementById('card-word').style.display = 'block';
-      document.getElementById('card-word').innerText = currentCard.name;
       document.getElementById('quiz-container').style.display = 'none';
-      document.getElementById('card-answer').style.display = 'block';
-      document.getElementById('answer-actions').style.display = 'flex';
+      answerEl.style.display = 'block';
+      showAnswerActions();
+    }
+
+    function showAnswerActions() {
+      const actions = document.getElementById('answer-actions');
+      actions.querySelectorAll('button').forEach(b => { b.disabled = false; });
+      actions.style.display = 'flex';
     }
 
     async function answerCard(answer) {
       if (!currentCard) return;
+      const actions = document.getElementById('answer-actions');
+      actions.querySelectorAll('button').forEach(b => { b.disabled = true; });
       await fetch(\`/api/cards/\${currentCard.session_card_id}/answer\`, {
         method: 'POST',
         headers: { 'Content-Type': 'application/json' },
         body: JSON.stringify({ answer })
       });
-      fetchNextCard();
+      await fetchNextCard();
     }
 
     function showCompletion(stats) {
@@ -869,14 +984,15 @@ const HTML_CONTENT = `
     let searchTimeout = null;
     function handleSearch(query) {
       clearTimeout(searchTimeout);
+      const resultsList = document.getElementById('search-results-list');
+      if (!query.trim()) {
+        resultsList.innerHTML = '';
+        return;
+      }
+      resultsList.innerHTML = '<div class="spinner" style="margin: 1rem auto;"></div>';
       searchTimeout = setTimeout(async () => {
-        if (!query.trim()) {
-          document.getElementById('search-results-list').innerHTML = '';
-          return;
-        }
         const res = await fetch(\`/api/search?q=\${encodeURIComponent(query)}\`);
         const results = await res.json();
-        const resultsList = document.getElementById('search-results-list');
 
         if (results.length === 0) {
           resultsList.innerHTML = '<p style="color: var(--muted); text-align: center; padding: 1rem;">No matching words found.</p>';
