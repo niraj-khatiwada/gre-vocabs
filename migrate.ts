@@ -30,8 +30,8 @@ db.run(`
     id INTEGER PRIMARY KEY AUTOINCREMENT,
     session_id INTEGER NOT NULL,
     vocab_id INTEGER NOT NULL,
-    card_order INTEGER NOT NULL,
-    status TEXT DEFAULT 'unseen', -- 'unseen', 'correct', 'incorrect'
+    attempted INTEGER DEFAULT 0, -- 0: unattempted, 1: attempted
+    flagged INTEGER DEFAULT 0,   -- 0: Right, 1: Wrong
     FOREIGN KEY(session_id) REFERENCES sessions(id),
     FOREIGN KEY(vocab_id) REFERENCES vocab(id)
   );
