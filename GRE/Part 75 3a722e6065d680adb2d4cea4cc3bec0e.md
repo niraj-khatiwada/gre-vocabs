@@ -126,6 +126,26 @@
     
     syn: **propitious**
     
+- **providential**
+    
+    *adjective*
+    
+    Meaning 1: apt; well-suited 
+    
+    syn: **felicitous**
+    
+    Meaning 2: happening at a fortunate time; seemingly caused by divine guidance or luck ⇒ well-suited that’s why happened at right time
+    
+    syn: **auspicious; serendipitous**
+    
+    🧠 providential = provide+destiny = lucky
+    
+    **The scientist's providential discovery of the missing data allowed the research team to complete the study.**
+    
+    **Their providential arrival at the station just before the train departed seemed almost too fortunate to be accidental.**
+    
+    **The rescue team's providential intervention prevented what might otherwise have been a serious disaster.**
+    
 - **digress**
     
     *verb*

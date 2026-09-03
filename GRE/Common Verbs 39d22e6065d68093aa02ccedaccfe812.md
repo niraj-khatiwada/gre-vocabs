@@ -40,9 +40,15 @@
     
     *verb*
     
-    demand a requirement as a part of the agreement
+    demand a requirement as a part of the agreement; to specify or require something as a condition or part of an agreement.
+    
+    ***“We’ll agree, but ONLY under these conditions.”***
     
     syn: **demand; press(for)**
+    
+    🧠 stipulate = agree to these terms to get stipend
+    
+    **The grant stipulated several conditions that the researchers had to satisfy before receiving the funds.**
     
     ---
     
@@ -92,4 +98,18 @@
     
     to assert
     
-    **The scientist maintained that the extinction**
+    **The scientist maintained that the extinction** 
+    
+- **stipulate**
+    
+    *verb*
+    
+    demand a requirement as a part of the agreement
+    
+    syn: **demand; press(for)**
+    
+    ---
+    
+    *noun*
+    
+    stipulation
